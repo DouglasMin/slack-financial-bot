@@ -1,0 +1,161 @@
+service: financial-bot
+useDotenv: true
+
+provider:
+  name: aws
+  profile: dongik2
+  runtime: nodejs22.x
+  region: ap-northeast-2
+  timeout: 29
+  environment:
+    OPENAI_API_KEY: ${env:OPENAI_API_KEY}
+    SLACK_BOT_TOKEN: ${env:SLACK_BOT_TOKEN}
+    SLACK_SIGNING_SECRET: ${env:SLACK_SIGNING_SECRET}
+    SLACK_CHANNEL_ID: ${env:SLACK_CHANNEL_ID}
+    ALPHA_VANTAGE_API_KEY: ${env:ALPHA_VANTAGE_API_KEY}
+    FINNHUB_API_KEY: ${env:FINNHUB_API_KEY}
+    NEWSDATA_API_KEY: ${env:NEWSDATA_API_KEY}
+    BRIEFING_TABLE: ${self:service}-${sls:stage}-briefings
+    WATCHLIST_TABLE: ${self:service}-${sls:stage}-watchlist
+    ALERT_TABLE: ${self:service}-${sls:stage}-alerts
+    CONVERSATION_TABLE: ${self:service}-${sls:stage}-conversations
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - lambda:InvokeFunction
+          Resource:
+            - arn:aws:lambda:ap-northeast-2:*:function:financial-bot-*
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:GetItem
+            - dynamodb:Query
+            - dynamodb:UpdateItem
+            - dynamodb:DeleteItem
+            - dynamodb:Scan
+          Resource:
+            - arn:aws:dynamodb:ap-northeast-2:*:table/financial-bot-*
+            - arn:aws:dynamodb:ap-northeast-2:*:table/financial-bot-*/index/*
+
+functions:
+  briefing:
+    handler: src/handlers/briefing.handler
+    timeout: 120
+    events:
+      - schedule: cron(0 0 * * ? *)
+      - schedule: cron(0 9 * * ? *)
+
+  slashCommand:
+    handler: src/handlers/slashCommand.handler
+    timeout: 29
+    events:
+      - httpApi:
+          path: /slack/commands
+          method: POST
+
+  conversation:
+    handler: src/handlers/conversation.handler
+    timeout: 29
+    environment:
+      WORKER_FUNCTION_NAME: !Ref ConversationWorkerLambdaFunction
+    events:
+      - httpApi:
+          path: /slack/events
+          method: POST
+
+  conversationWorker:
+    handler: src/handlers/conversationWorker.handler
+    timeout: 120
+
+  alertPoller:
+    handler: src/handlers/alertPoller.handler
+    timeout: 30
+    events:
+      - schedule: rate(5 minutes)
+
+resources:
+  Resources:
+    BriefingTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.BRIEFING_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: userId
+            AttributeType: S
+          - AttributeName: date
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
+          - AttributeName: date
+            KeyType: RANGE
+        GlobalSecondaryIndexes:
+          - IndexName: date-index
+            KeySchema:
+              - AttributeName: date
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+
+    WatchlistTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.WATCHLIST_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: userId
+            AttributeType: S
+          - AttributeName: symbol
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
+          - AttributeName: symbol
+            KeyType: RANGE
+
+    AlertTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.ALERT_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: userId
+            AttributeType: S
+          - AttributeName: alertId
+            AttributeType: S
+          - AttributeName: active
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
+          - AttributeName: alertId
+            KeyType: RANGE
+        GlobalSecondaryIndexes:
+          - IndexName: active-index
+            KeySchema:
+              - AttributeName: active
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+
+    ConversationTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.CONVERSATION_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        TimeToLiveSpecification:
+          AttributeName: expireAt
+          Enabled: true
+        AttributeDefinitions:
+          - AttributeName: userId
+            AttributeType: S
+          - AttributeName: timestamp
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
+          - AttributeName: timestamp
+            KeyType: RANGE
