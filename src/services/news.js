@@ -8,6 +8,54 @@ const NEWSDATA_API_KEY = process.env.NEWSDATA_API_KEY;
 const FINNHUB_BASE = 'https://finnhub.io/api/v1';
 const NEWSDATA_BASE = 'https://newsdata.io/api/1';
 
+// Keyword expansion map: user keyword → search variants for better news coverage
+const KEYWORD_ALIASES = {
+  BTC: ['bitcoin', 'BTC'],
+  bitcoin: ['bitcoin', 'BTC'],
+  비트코인: ['bitcoin', 'BTC'],
+  ETH: ['ethereum', 'ETH'],
+  ethereum: ['ethereum', 'ETH'],
+  이더리움: ['ethereum', 'ETH'],
+  DOGE: ['dogecoin', 'DOGE'],
+  dogecoin: ['dogecoin', 'DOGE'],
+  도지코인: ['dogecoin', 'DOGE'],
+  도지: ['dogecoin', 'DOGE'],
+  XRP: ['ripple', 'XRP'],
+  ripple: ['ripple', 'XRP'],
+  리플: ['ripple', 'XRP'],
+  SOL: ['solana', 'SOL'],
+  solana: ['solana', 'SOL'],
+  솔라나: ['solana', 'SOL'],
+  ADA: ['cardano', 'ADA'],
+  에이다: ['cardano', 'ADA'],
+  AAPL: ['Apple', 'AAPL'],
+  애플: ['Apple', 'AAPL'],
+  TSLA: ['Tesla', 'TSLA'],
+  테슬라: ['Tesla', 'TSLA'],
+  NVDA: ['Nvidia', 'NVDA'],
+  엔비디아: ['Nvidia', 'NVDA'],
+  삼성: ['Samsung Electronics', '삼성전자'],
+  삼성전자: ['Samsung Electronics', '삼성전자'],
+  하이닉스: ['SK Hynix', 'SK하이닉스'],
+  카카오: ['Kakao', '카카오'],
+  네이버: ['Naver', '네이버'],
+};
+
+/**
+ * Expand user keywords into broader search terms using alias map.
+ */
+function expandKeywords(keywords) {
+  const expanded = new Set();
+  for (const kw of keywords) {
+    const aliases = KEYWORD_ALIASES[kw] || KEYWORD_ALIASES[kw.toUpperCase()];
+    if (aliases) {
+      aliases.forEach((a) => expanded.add(a));
+    }
+    expanded.add(kw); // always keep original
+  }
+  return [...expanded];
+}
+
 /**
  * Fetch financial news from Finnhub (general market news) + NewsData.io (keyword search).
  * Falls back gracefully if one source fails.
@@ -17,11 +65,12 @@ const NEWSDATA_BASE = 'https://newsdata.io/api/1';
 export async function fetchNews(keywords = []) {
   const sources = [];
 
+  // Expand keywords for better coverage (e.g. "DOGE" → ["dogecoin", "DOGE"])
+  const expanded = keywords.length > 0 ? expandKeywords(keywords) : [];
+
   // Detect crypto-related keywords to also fetch crypto-specific news from Finnhub
-  const cryptoTerms = ['crypto', 'bitcoin', 'btc', 'eth', 'ethereum', 'doge', 'dogecoin', 'sol', 'solana', 'xrp', '코인', '비트코인', '이더리움', '도지', '리플'];
-  const hasCryptoKeyword = keywords.some((kw) =>
-    cryptoTerms.includes(kw.toLowerCase()),
-  );
+  const cryptoTerms = new Set(['crypto', 'bitcoin', 'btc', 'eth', 'ethereum', 'doge', 'dogecoin', 'sol', 'solana', 'xrp', 'ripple', 'cardano', 'ada', '코인', '비트코인', '이더리움', '도지', '리플', '솔라나', '에이다']);
+  const hasCryptoKeyword = expanded.some((kw) => cryptoTerms.has(kw.toLowerCase()));
 
   // Source 1: Finnhub market news
   sources.push(fetchFinnhubNews('general'));
@@ -30,8 +79,8 @@ export async function fetchNews(keywords = []) {
   }
 
   // Source 2: NewsData.io keyword search (if keywords provided and API key exists)
-  if (keywords.length > 0 && NEWSDATA_API_KEY) {
-    sources.push(fetchNewsDataArticles(keywords));
+  if (expanded.length > 0 && NEWSDATA_API_KEY) {
+    sources.push(fetchNewsDataArticles(expanded));
   }
 
   const results = await Promise.allSettled(sources);
@@ -79,6 +128,7 @@ async function fetchFinnhubNews(category = 'general') {
     console.log(`[news.fetchFinnhubNews] category=${category}, results=${(response.data || []).length}`);
     return (response.data || []).slice(0, 10).map((item) => ({
       title: item.headline || '',
+      description: item.summary || '',
       url: item.url || '',
       publishedAt: item.datetime ? new Date(item.datetime * 1000).toISOString() : '',
       source: item.source || 'Finnhub',
@@ -113,6 +163,7 @@ async function fetchNewsDataArticles(keywords) {
     console.log(`[news.fetchNewsDataArticles] query="${keywords.join(' OR ')}", results=${results.length}`);
     return results.map((item) => ({
       title: item.title || '',
+      description: item.description || '',
       url: item.link || '',
       publishedAt: item.pubDate || '',
       source: item.source_name || 'NewsData',
@@ -128,21 +179,49 @@ async function fetchNewsDataArticles(keywords) {
  * Individual failures are logged but do not break the batch.
  */
 export async function summarizeArticles(articles) {
-  const promises = articles.map(async (article) => {
-    try {
-      const summary = await chat(
-        [
-          {
-            role: 'system',
-            content: '당신은 금융 뉴스 요약 전문가입니다. 기사 제목을 바탕으로 핵심 내용을 한국어로 2~3줄로 요약해주세요.',
-          },
-          {
-            role: 'user',
-            content: `기사 제목: ${article.title}\nURL: ${article.url}`,
-          },
-        ],
-        { model: 'gpt-5-mini', maxTokens: 300 },
-      );
+  // Batch all articles into a single GPT call for efficiency
+  if (articles.length === 0) return [];
+
+  const articleList = articles.map((a, i) => {
+    let entry = `${i + 1}. 제목: ${a.title}`;
+    if (a.description) entry += `\n   내용: ${a.description}`;
+    return entry;
+  }).join('\n\n');
+
+  try {
+    const response = await chat(
+      [
+        {
+          role: 'system',
+          content: `당신은 금융 뉴스 분석 전문가입니다. 아래 기사들을 각각 분석해주세요.
+
+각 기사마다 다음 형식으로 출력하세요:
+[상승] 또는 [하락] 또는 [중립] 감성 태그 + 한국어 요약 1~2줄
+
+규칙:
+- 시장/자산 가격에 긍정적 영향 → [상승]
+- 시장/자산 가격에 부정적 영향 → [하락]
+- 방향성 불명확 또는 정보 전달 → [중립]
+- 각 기사 번호를 앞에 붙여주세요
+- 추측이나 의견 없이 사실 위주로 간결하게`,
+        },
+        {
+          role: 'user',
+          content: articleList,
+        },
+      ],
+      { model: 'gpt-5-mini', maxTokens: 2048 },
+    );
+
+    // Parse batch response back into individual summaries
+    const lines = response.split('\n').filter((l) => l.trim());
+    return articles.map((article, i) => {
+      // Find lines matching this article number
+      const prefix = `${i + 1}.`;
+      const matchedLines = lines.filter((l) => l.trim().startsWith(prefix));
+      const summary = matchedLines.length > 0
+        ? matchedLines.map((l) => l.replace(/^\d+\.\s*/, '').trim()).join(' ')
+        : lines[i]?.replace(/^\d+\.\s*/, '').trim() || '';
 
       return {
         title: article.title,
@@ -150,41 +229,41 @@ export async function summarizeArticles(articles) {
         url: article.url,
         publishedAt: article.publishedAt,
       };
-    } catch (error) {
-      console.error(`[news.summarizeArticles] Failed to summarize "${article.title}":`, error.message);
-      return {
-        title: article.title,
-        summary: '요약을 생성할 수 없습니다.',
-        url: article.url,
-        publishedAt: article.publishedAt,
-      };
-    }
-  });
-
-  const results = await Promise.allSettled(promises);
-
-  return results
-    .filter((r) => r.status === 'fulfilled')
-    .map((r) => r.value);
+    });
+  } catch (error) {
+    console.error('[news.summarizeArticles] Batch summarization failed:', error.message);
+    return articles.map((article) => ({
+      title: article.title,
+      summary: '요약을 생성할 수 없습니다.',
+      url: article.url,
+      publishedAt: article.publishedAt,
+    }));
+  }
 }
 
 /**
  * Summarize a single article by URL and title (for agents/tools).
  */
-export async function summarizeArticle(url, title) {
+export async function summarizeArticle(url, title, description = '') {
   try {
+    const content = description
+      ? `제목: ${title}\n내용: ${description}`
+      : `제목: ${title}`;
+
     const summary = await chat(
       [
         {
           role: 'system',
-          content: '당신은 금융 뉴스 요약 전문가입니다. 기사 제목과 URL을 바탕으로 핵심 내용을 한국어로 2~3줄로 요약해주세요.',
+          content: `금융 뉴스 분석 전문가입니다. 다음 형식으로 출력하세요:
+[상승] 또는 [하락] 또는 [중립] 감성 태그 + 한국어 요약 1~2줄
+사실 위주로 간결하게 작성하세요.`,
         },
         {
           role: 'user',
-          content: `기사 제목: ${title}\nURL: ${url}`,
+          content,
         },
       ],
-      { model: 'gpt-5-mini', maxTokens: 300 },
+      { model: 'gpt-5-mini', maxTokens: 1024 },
     );
 
     return { title, summary, url };

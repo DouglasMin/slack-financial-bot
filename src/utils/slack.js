@@ -59,14 +59,20 @@ export function formatBriefing({ prices, news, analysis, isAM }) {
 export function formatPriceSection(prices) {
   const blocks = [];
 
-  for (const { symbol, price, change, changePercent } of prices) {
-    const emoji = change >= 0 ? '🔺' : '🔻';
-    const sign = change >= 0 ? '+' : '';
+  for (const item of prices) {
+    if (!item) continue;
+    const { symbol, price, rate, change, changePercent, from, to } = item;
+    const displayPrice = price ?? rate ?? 0;
+    const displayChange = change ?? 0;
+    const displayPercent = changePercent ?? '0.00';
+    const displaySymbol = from && to ? `${from}/${to}` : symbol;
+    const emoji = displayChange >= 0 ? '🔺' : '🔻';
+    const sign = displayChange >= 0 ? '+' : '';
     blocks.push({
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: `*${symbol}*  ${price.toLocaleString()}  ${emoji} ${sign}${change.toLocaleString()} (${sign}${changePercent}%)`,
+        text: `*${displaySymbol}*  ${displayPrice.toLocaleString()}  ${emoji} ${sign}${displayChange.toLocaleString()} (${sign}${displayPercent}%)`,
       },
     });
   }

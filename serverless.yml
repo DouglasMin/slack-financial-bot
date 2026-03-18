@@ -42,7 +42,7 @@ provider:
 functions:
   briefing:
     handler: src/handlers/briefing.handler
-    timeout: 120
+    timeout: 300
     events:
       - schedule: cron(0 0 * * ? *)
       - schedule: cron(0 9 * * ? *)
