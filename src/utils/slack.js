@@ -56,6 +56,21 @@ export function formatBriefing({ prices, news, analysis, isAM }) {
 /**
  * 가격 데이터 블록 배열 반환
  */
+// Korean stock codes: 6-digit number or ending with .KS/.KQ
+const KOREAN_STOCK_RE = /^\d{6}(\.KS|\.KQ)?$/;
+
+function getCurrencyPrefix(item) {
+  const { symbol, from, to, instId } = item;
+  // FX
+  if (from && to) return to === 'KRW' ? '₩' : '';
+  // Crypto (has instId from OKX, or symbol in known crypto list)
+  if (instId || (symbol && !KOREAN_STOCK_RE.test(symbol) && !symbol.includes('.'))) return '$';
+  // Korean stock
+  if (symbol && KOREAN_STOCK_RE.test(symbol)) return '₩';
+  // US stock or other
+  return '$';
+}
+
 export function formatPriceSection(prices) {
   const blocks = [];
 
@@ -66,13 +81,14 @@ export function formatPriceSection(prices) {
     const displayChange = change ?? 0;
     const displayPercent = changePercent ?? '0.00';
     const displaySymbol = from && to ? `${from}/${to}` : symbol;
+    const prefix = getCurrencyPrefix(item);
     const emoji = displayChange >= 0 ? '🔺' : '🔻';
     const sign = displayChange >= 0 ? '+' : '';
     blocks.push({
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: `*${displaySymbol}*  ${displayPrice.toLocaleString()}  ${emoji} ${sign}${displayChange.toLocaleString()} (${sign}${displayPercent}%)`,
+        text: `*${displaySymbol}*  ${prefix}${displayPrice.toLocaleString()}  ${emoji} ${sign}${displayChange.toLocaleString()} (${sign}${displayPercent}%)`,
       },
     });
   }

@@ -19,6 +19,7 @@ provider:
     WATCHLIST_TABLE: ${self:service}-${sls:stage}-watchlist
     ALERT_TABLE: ${self:service}-${sls:stage}-alerts
     CONVERSATION_TABLE: ${self:service}-${sls:stage}-conversations
+    NEWS_CACHE_TABLE: ${self:service}-${sls:stage}-news-cache
   iam:
     role:
       statements:
@@ -67,7 +68,7 @@ functions:
 
   conversationWorker:
     handler: src/handlers/conversationWorker.handler
-    timeout: 120
+    timeout: 300
 
   alertPoller:
     handler: src/handlers/alertPoller.handler
@@ -159,3 +160,18 @@ resources:
             KeyType: HASH
           - AttributeName: timestamp
             KeyType: RANGE
+
+    NewsCacheTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.NEWS_CACHE_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        TimeToLiveSpecification:
+          AttributeName: expireAt
+          Enabled: true
+        AttributeDefinitions:
+          - AttributeName: cacheKey
+            AttributeType: S
+        KeySchema:
+          - AttributeName: cacheKey
+            KeyType: HASH

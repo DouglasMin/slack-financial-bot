@@ -9,8 +9,12 @@ export const getCryptoPriceTool = tool({
     symbol: z.string().describe('코인 티커 심볼 (예: BTC, ETH, DOGE, SOL, XRP)'),
   }),
   execute: async ({ symbol }) => {
-    const result = await market.getCryptoPrice(symbol);
-    return JSON.stringify(result);
+    try {
+      const result = await market.getCryptoPrice(symbol);
+      return JSON.stringify(result);
+    } catch (error) {
+      return JSON.stringify({ error: true, message: `암호화폐 ${symbol} 시세를 조회할 수 없습니다. 심볼을 확인해주세요. (지원: BTC, ETH, XRP, SOL, DOGE 등)` });
+    }
   },
 });
 
@@ -21,8 +25,15 @@ export const getStockPriceTool = tool({
     symbol: z.string().describe('종목 코드 (예: AAPL, TSLA, NVDA, 005930.KS)'),
   }),
   execute: async ({ symbol }) => {
-    const result = await market.getStockPrice(symbol);
-    return JSON.stringify(result);
+    try {
+      const result = await market.getStockPrice(symbol);
+      return JSON.stringify(result);
+    } catch (error) {
+      const msg = error.message?.includes('한도 초과')
+        ? `Alpha Vantage API 일일 한도 초과로 주식 시세를 조회할 수 없습니다. 코인이나 환율은 조회 가능합니다.`
+        : `주식 ${symbol} 시세를 조회할 수 없습니다. 종목 코드를 확인해주세요. (한국주는 6자리코드.KS 형식)`;
+      return JSON.stringify({ error: true, message: msg });
+    }
   },
 });
 
@@ -34,7 +45,11 @@ export const getFxRateTool = tool({
     to: z.string().describe('대상 통화 코드 (예: KRW, USD)'),
   }),
   execute: async ({ from, to }) => {
-    const result = await market.getFxRate(from, to);
-    return JSON.stringify(result);
+    try {
+      const result = await market.getFxRate(from, to);
+      return JSON.stringify(result);
+    } catch (error) {
+      return JSON.stringify({ error: true, message: `${from}/${to} 환율을 조회할 수 없습니다. 통화 코드를 확인해주세요. (예: USD, KRW, JPY, EUR)` });
+    }
   },
 });

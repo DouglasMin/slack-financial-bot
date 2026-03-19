@@ -3,14 +3,15 @@
   "version": "1.0.0",
   "type": "module",
   "dependencies": {
-    "@openai/agents": "^0.7.2",
-    "openai": "^6.29.0",
-    "zod": "^4.3.6",
-    "@slack/web-api": "^7.15.0",
     "@aws-sdk/client-dynamodb": "^3.1010.0",
     "@aws-sdk/client-lambda": "^3.1010.0",
     "@aws-sdk/lib-dynamodb": "^3.1010.0",
+    "@openai/agents": "^0.7.2",
+    "@slack/web-api": "^7.15.0",
     "axios": "^1.13.6",
-    "uuid": "^13.0.0"
+    "openai": "^6.29.0",
+    "rss-parser": "^3.13.0",
+    "uuid": "^13.0.0",
+    "zod": "^4.3.6"
   }
 }

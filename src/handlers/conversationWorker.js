@@ -19,10 +19,17 @@ export async function handler(event) {
       console.warn('Failed to load watchlist:', err.message);
     }
 
-    // 2. Run conversation through orchestrator agent
+    // 2. Send "processing" indicator immediately
+    await slackClient.chat.postMessage({
+      channel,
+      text: '🔍 분석 중입니다. 잠시만 기다려주세요...',
+      thread_ts: threadTs,
+    });
+
+    // 3. Run conversation through orchestrator agent
     const response = await runConversation(userId, text, watchlist);
 
-    // 3. Reply in thread
+    // 4. Reply in thread
     await slackClient.chat.postMessage({
       channel,
       text: response || '응답을 생성하지 못했습니다.',

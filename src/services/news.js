@@ -1,117 +1,189 @@
 import axios from 'axios';
+import Parser from 'rss-parser';
 import { consume } from '../utils/rateLimit.js';
 import { chat } from './openai.js';
+import * as store from './store.js';
+
+const rssParser = new Parser();
 
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 const NEWSDATA_API_KEY = process.env.NEWSDATA_API_KEY;
+const NEWS_CACHE_TABLE = process.env.NEWS_CACHE_TABLE;
+const NEWS_CACHE_TTL = 5 * 60; // 5 minutes
 
 const FINNHUB_BASE = 'https://finnhub.io/api/v1';
 const NEWSDATA_BASE = 'https://newsdata.io/api/1';
 
-// Keyword expansion map: user keyword → search variants for better news coverage
-const KEYWORD_ALIASES = {
-  BTC: ['bitcoin', 'BTC'],
-  bitcoin: ['bitcoin', 'BTC'],
-  비트코인: ['bitcoin', 'BTC'],
-  ETH: ['ethereum', 'ETH'],
-  ethereum: ['ethereum', 'ETH'],
-  이더리움: ['ethereum', 'ETH'],
-  DOGE: ['dogecoin', 'DOGE'],
-  dogecoin: ['dogecoin', 'DOGE'],
-  도지코인: ['dogecoin', 'DOGE'],
-  도지: ['dogecoin', 'DOGE'],
-  XRP: ['ripple', 'XRP'],
-  ripple: ['ripple', 'XRP'],
-  리플: ['ripple', 'XRP'],
-  SOL: ['solana', 'SOL'],
-  solana: ['solana', 'SOL'],
-  솔라나: ['solana', 'SOL'],
-  ADA: ['cardano', 'ADA'],
-  에이다: ['cardano', 'ADA'],
-  AAPL: ['Apple', 'AAPL'],
-  애플: ['Apple', 'AAPL'],
-  TSLA: ['Tesla', 'TSLA'],
-  테슬라: ['Tesla', 'TSLA'],
-  NVDA: ['Nvidia', 'NVDA'],
-  엔비디아: ['Nvidia', 'NVDA'],
-  삼성: ['Samsung Electronics', '삼성전자'],
-  삼성전자: ['Samsung Electronics', '삼성전자'],
-  하이닉스: ['SK Hynix', 'SK하이닉스'],
-  카카오: ['Kakao', '카카오'],
-  네이버: ['Naver', '네이버'],
-};
+// ---------------------------------------------------------------------------
+// Cache helpers
+// ---------------------------------------------------------------------------
 
-/**
- * Expand user keywords into broader search terms using alias map.
- */
-function expandKeywords(keywords) {
-  const expanded = new Set();
-  for (const kw of keywords) {
-    const aliases = KEYWORD_ALIASES[kw] || KEYWORD_ALIASES[kw.toUpperCase()];
-    if (aliases) {
-      aliases.forEach((a) => expanded.add(a));
+async function getCached(cacheKey) {
+  if (!NEWS_CACHE_TABLE) return null;
+  try {
+    const cached = await store.getItem(NEWS_CACHE_TABLE, { cacheKey });
+    if (cached && cached.expireAt > Math.floor(Date.now() / 1000)) {
+      console.log(`[news] Cache hit for "${cacheKey}"`);
+      return JSON.parse(cached.articles);
     }
-    expanded.add(kw); // always keep original
+  } catch {
+    // Cache miss or error
   }
-  return [...expanded];
+  return null;
 }
 
-/**
- * Fetch financial news from Finnhub (general market news) + NewsData.io (keyword search).
- * Falls back gracefully if one source fails.
- * @param {string[]} keywords - If provided, also searches NewsData.io for keyword-specific articles.
- * @returns {Promise<Array<{title: string, url: string, publishedAt: string, source: string}>>} Top 5 articles sorted by date desc.
- */
-export async function fetchNews(keywords = []) {
-  const sources = [];
+function setCache(cacheKey, articles) {
+  if (!NEWS_CACHE_TABLE) return;
+  store.putItem(NEWS_CACHE_TABLE, {
+    cacheKey,
+    articles: JSON.stringify(articles),
+    expireAt: Math.floor(Date.now() / 1000) + NEWS_CACHE_TTL,
+  }).catch((err) => console.warn('[news] Cache write failed:', err.message));
+}
 
-  // Expand keywords for better coverage (e.g. "DOGE" → ["dogecoin", "DOGE"])
-  const expanded = keywords.length > 0 ? expandKeywords(keywords) : [];
+// ---------------------------------------------------------------------------
+// Dedup + sort helper
+// ---------------------------------------------------------------------------
 
-  // Detect crypto-related keywords to also fetch crypto-specific news from Finnhub
-  const cryptoTerms = new Set(['crypto', 'bitcoin', 'btc', 'eth', 'ethereum', 'doge', 'dogecoin', 'sol', 'solana', 'xrp', 'ripple', 'cardano', 'ada', '코인', '비트코인', '이더리움', '도지', '리플', '솔라나', '에이다']);
-  const hasCryptoKeyword = expanded.some((kw) => cryptoTerms.has(kw.toLowerCase()));
-
-  // Source 1: Finnhub market news
-  sources.push(fetchFinnhubNews('general'));
-  if (hasCryptoKeyword) {
-    sources.push(fetchFinnhubNews('crypto'));
-  }
-
-  // Source 2: NewsData.io keyword search (if keywords provided and API key exists)
-  if (expanded.length > 0 && NEWSDATA_API_KEY) {
-    sources.push(fetchNewsDataArticles(expanded));
-  }
-
-  const results = await Promise.allSettled(sources);
-
-  let articles = results
-    .filter((r) => r.status === 'fulfilled')
-    .flatMap((r) => r.value);
-
-  // Deduplicate by title similarity
+function dedupeAndSort(articles, limit = 5) {
   const seen = new Set();
-  articles = articles.filter((article) => {
+  const deduped = articles.filter((article) => {
     const key = article.title.toLowerCase().slice(0, 60);
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
   });
 
-  // Sort by date descending
-  articles.sort((a, b) => {
+  deduped.sort((a, b) => {
     const dateA = a.publishedAt ? new Date(a.publishedAt).getTime() : 0;
     const dateB = b.publishedAt ? new Date(b.publishedAt).getTime() : 0;
     return dateB - dateA;
   });
 
-  return articles.slice(0, 5);
+  return deduped.slice(0, limit);
 }
 
+// ---------------------------------------------------------------------------
+// 1. Company News — 개별 주식 종목 뉴스 (Finnhub company-news + NewsData.io)
+// ---------------------------------------------------------------------------
+
 /**
- * Fetch general market news from Finnhub.
- * Free tier: 60 calls/min, no credit card required.
+ * Fetch news for a specific stock ticker.
+ * @param {string} symbol - Stock ticker (e.g. "NVDA", "AAPL", "TSLA")
+ * @param {string[]} keywords - Additional search keywords for NewsData.io
  */
+export async function fetchCompanyNews(symbol, keywords = []) {
+  const cacheKey = `company:${symbol}`;
+  const cached = await getCached(cacheKey);
+  if (cached) return cached;
+
+  const sources = [];
+
+  // Finnhub company-news (ticker-specific)
+  sources.push(fetchFinnhubCompanyNews(symbol));
+
+  // Google News RSS + NewsData.io keyword search
+  if (keywords.length > 0) {
+    sources.push(fetchGoogleNewsArticles(keywords));
+    if (NEWSDATA_API_KEY) sources.push(fetchNewsDataArticles(keywords));
+  }
+
+  const results = await Promise.allSettled(sources);
+  const articles = results
+    .filter((r) => r.status === 'fulfilled')
+    .flatMap((r) => r.value);
+
+  const final = dedupeAndSort(articles);
+  setCache(cacheKey, final);
+  return final;
+}
+
+// ---------------------------------------------------------------------------
+// 2. Crypto News — 암호화폐 뉴스 (Finnhub crypto category + NewsData.io)
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch cryptocurrency-related news.
+ * @param {string[]} keywords - Search keywords (e.g. ["bitcoin", "BTC"])
+ */
+export async function fetchCryptoNews(keywords = []) {
+  const cacheKey = `crypto:${keywords.map((k) => k.toLowerCase()).sort().join('|')}`;
+  const cached = await getCached(cacheKey);
+  if (cached) return cached;
+
+  const sources = [];
+
+  // Finnhub crypto category
+  sources.push(fetchFinnhubNews('crypto'));
+
+  // Google News RSS + NewsData.io keyword search
+  if (keywords.length > 0) {
+    sources.push(fetchGoogleNewsArticles(keywords));
+    if (NEWSDATA_API_KEY) sources.push(fetchNewsDataArticles(keywords));
+  }
+
+  const results = await Promise.allSettled(sources);
+  const articles = results
+    .filter((r) => r.status === 'fulfilled')
+    .flatMap((r) => r.value);
+
+  const final = dedupeAndSort(articles);
+  setCache(cacheKey, final);
+  return final;
+}
+
+// ---------------------------------------------------------------------------
+// 3. General News — 일반 시장/경제 뉴스 (Finnhub general + NewsData.io)
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch general market/economy news.
+ * @param {string[]} keywords - Optional keywords to search NewsData.io + Google News
+ */
+export async function fetchGeneralNews(keywords = []) {
+  const cacheKey = keywords.length > 0
+    ? `general:${keywords.map((k) => k.toLowerCase()).sort().join('|')}`
+    : 'general:__all__';
+  const cached = await getCached(cacheKey);
+  if (cached) return cached;
+
+  let articles = [];
+
+  if (keywords.length > 0) {
+    // Keyword search: use NewsData.io + Google News RSS only (no Finnhub general noise)
+    const sources = [fetchGoogleNewsArticles(keywords)];
+    if (NEWSDATA_API_KEY) sources.push(fetchNewsDataArticles(keywords));
+
+    const results = await Promise.allSettled(sources);
+    articles = results
+      .filter((r) => r.status === 'fulfilled')
+      .flatMap((r) => r.value);
+  } else {
+    // No keywords — general market overview from Finnhub
+    try {
+      articles = await fetchFinnhubNews('general');
+    } catch {
+      articles = [];
+    }
+  }
+
+  const final = dedupeAndSort(articles);
+  setCache(cacheKey, final);
+  return final;
+}
+
+// ---------------------------------------------------------------------------
+// Legacy fetchNews — slash command 등에서 아직 사용. 추후 제거 예정.
+// ---------------------------------------------------------------------------
+
+export async function fetchNews(keywords = []) {
+  return fetchGeneralNews(keywords);
+}
+
+// ---------------------------------------------------------------------------
+// Finnhub API calls
+// ---------------------------------------------------------------------------
+
 async function fetchFinnhubNews(category = 'general') {
   try {
     if (!(await consume('finnhub'))) {
@@ -119,10 +191,7 @@ async function fetchFinnhubNews(category = 'general') {
       return [];
     }
     const response = await axios.get(`${FINNHUB_BASE}/news`, {
-      params: {
-        category,
-        token: FINNHUB_API_KEY,
-      },
+      params: { category, token: FINNHUB_API_KEY },
     });
 
     console.log(`[news.fetchFinnhubNews] category=${category}, results=${(response.data || []).length}`);
@@ -139,10 +208,65 @@ async function fetchFinnhubNews(category = 'general') {
   }
 }
 
-/**
- * Search NewsData.io for keyword-specific financial articles.
- * Free tier: 200 credits/day (~200 requests).
- */
+async function fetchFinnhubCompanyNews(symbol) {
+  try {
+    if (!(await consume('finnhub'))) {
+      console.warn('[news] Finnhub rate limit reached (60/min)');
+      return [];
+    }
+    const to = new Date().toISOString().slice(0, 10);
+    const from = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+
+    const response = await axios.get(`${FINNHUB_BASE}/company-news`, {
+      params: { symbol, from, to, token: FINNHUB_API_KEY },
+    });
+
+    console.log(`[news.fetchFinnhubCompanyNews] symbol=${symbol}, results=${(response.data || []).length}`);
+    return (response.data || []).slice(0, 10).map((item) => ({
+      title: item.headline || '',
+      description: item.summary || '',
+      url: item.url || '',
+      publishedAt: item.datetime ? new Date(item.datetime * 1000).toISOString() : '',
+      source: item.source || 'Finnhub',
+    }));
+  } catch (error) {
+    console.error(`[news.fetchFinnhubCompanyNews] Failed for ${symbol}:`, error.message);
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Google News RSS (free, no API key, good Korean news coverage)
+// ---------------------------------------------------------------------------
+
+async function fetchGoogleNewsArticles(keywords) {
+  try {
+    const query = encodeURIComponent(keywords.join(' '));
+    const url = `https://news.google.com/rss/search?q=${query}&hl=ko&gl=KR&ceid=KR:ko`;
+
+    console.log(`[news.fetchGoogleNewsArticles] query="${keywords.join(' ')}"`);
+    const feed = await rssParser.parseURL(url);
+
+    const articles = (feed.items || []).slice(0, 10).map((item) => ({
+      title: item.title || '',
+      description: item.contentSnippet || item.content || '',
+      url: item.link || '',
+      publishedAt: item.isoDate || item.pubDate || '',
+      source: item.source?.name || 'Google News',
+    }));
+
+    console.log(`[news.fetchGoogleNewsArticles] results=${articles.length}`);
+    return articles;
+  } catch (error) {
+    console.error('[news.fetchGoogleNewsArticles] Failed:', error.message);
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// NewsData.io
+// ---------------------------------------------------------------------------
+
 async function fetchNewsDataArticles(keywords) {
   try {
     if (!(await consume('newsdata'))) {
@@ -174,12 +298,14 @@ async function fetchNewsDataArticles(keywords) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Summarization
+// ---------------------------------------------------------------------------
+
 /**
- * Summarize multiple articles using gpt-5-mini (Korean).
- * Individual failures are logged but do not break the batch.
+ * Batch-summarize articles with sentiment tags using gpt-5-mini.
  */
 export async function summarizeArticles(articles) {
-  // Batch all articles into a single GPT call for efficiency
   if (articles.length === 0) return [];
 
   const articleList = articles.map((a, i) => {
@@ -205,18 +331,13 @@ export async function summarizeArticles(articles) {
 - 각 기사 번호를 앞에 붙여주세요
 - 추측이나 의견 없이 사실 위주로 간결하게`,
         },
-        {
-          role: 'user',
-          content: articleList,
-        },
+        { role: 'user', content: articleList },
       ],
       { model: 'gpt-5-mini', maxTokens: 2048 },
     );
 
-    // Parse batch response back into individual summaries
     const lines = response.split('\n').filter((l) => l.trim());
     return articles.map((article, i) => {
-      // Find lines matching this article number
       const prefix = `${i + 1}.`;
       const matchedLines = lines.filter((l) => l.trim().startsWith(prefix));
       const summary = matchedLines.length > 0
@@ -241,9 +362,6 @@ export async function summarizeArticles(articles) {
   }
 }
 
-/**
- * Summarize a single article by URL and title (for agents/tools).
- */
 export async function summarizeArticle(url, title, description = '') {
   try {
     const content = description
@@ -258,10 +376,7 @@ export async function summarizeArticle(url, title, description = '') {
 [상승] 또는 [하락] 또는 [중립] 감성 태그 + 한국어 요약 1~2줄
 사실 위주로 간결하게 작성하세요.`,
         },
-        {
-          role: 'user',
-          content,
-        },
+        { role: 'user', content },
       ],
       { model: 'gpt-5-mini', maxTokens: 1024 },
     );
